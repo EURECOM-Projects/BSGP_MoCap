@@ -1,10 +1,13 @@
 import tensorflow as tf
 import numpy as np
 from scipy.cluster.vq import kmeans2
+import tensorflow_probability as tfp
 
 from .base_model import BaseModel
 from . import conditionals
 from .utils import get_rand
+from .prior import logdet_jacobian, laplace_logprob, normal_logprob, horseshoe_logprob, matrix_wishart_logprob, matrix_invwishart_logprob
+import sys
 
 def set_seed(seed=0):
     import random
@@ -41,12 +44,16 @@ class Strauss(object):
 
 
 class Layer(object):
-    def __init__(self, kern, outputs, n_inducing, fixed_mean, X, full_cov, prior_type="uniform"): # uniform / normal / point
+    def __init__(self, kern, precise_kernel, outputs, n_inducing, fixed_mean, X, full_cov, prior_type="uniform", prior_precision_type="laplace", prior_laplace_b=1): # uniform / normal / point
         self.inputs, self.outputs, self.kernel = kern.input_dim, outputs, kern
         self.M, self.fixed_mean = n_inducing, fixed_mean
         self.full_cov = full_cov
         self.prior_type = prior_type
         self.X = X
+        self.precise_kernel = precise_kernel # LRBF-MOD
+        self.prior_precision_type = prior_precision_type # LRBF-MOD
+        self.prior_laplace_b = prior_laplace_b # LRBF-MOD
+        #self.Kc = commutation_matrix(self.X.shape[1], self.X.shape[1])
         if prior_type == "strauss":
             self.pZ = Strauss(R=0.5)
 
@@ -65,16 +72,14 @@ class Layer(object):
         self.U = tf.Variable(np.zeros((self.M, self.outputs)), dtype=tf.float64, trainable=False, name='U')
         # self.U = tf.Variable(np.random.randn(self.M, self.outputs), dtype=tf.float64, trainable=False, name='U')
         self.Lm = None
-
-
+    @tf.function
     def conditional(self, X):
-
         mean, var, self.Lm = conditionals.conditional(X, self.Z, self.kernel, self.U, white=True, full_cov=self.full_cov, return_Lm=True)
-        
+        #tf.print({'Lm': self.Lm}, output_stream=sys.stderr)
         if self.fixed_mean:
-            mean += tf.matmul(X, tf.cast(self.mean, tf.float64))
+            mean += tf.matmul(X, tf.cast(self.mean, tf.float64))    
         return mean, var
-
+    
     def prior_Z(self):
         if self.prior_type == "uniform":
             return 0.
@@ -95,9 +100,36 @@ class Layer(object):
             raise Exception("Invalid prior type")
 
     def prior_hyper(self):
-        return -tf.reduce_sum(tf.square(self.kernel.loglengthscales)) / 2.0 - tf.reduce_sum(tf.square(self.kernel.logvariance - np.log(0.05))) / 2.0
+        # Lognormal(0,0.05) prior on kernel logvariance
+        prior_kernel_logvariance =  -tf.reduce_sum(tf.square(self.kernel.logvariance - np.log(0.05))) / 2.0
+        if self.precise_kernel:
+            logdet = logdet_jacobian(self.kernel.L)
+            if self.prior_precision_type == 'laplace':
+                # Laplace(Λ|0,b)
+                prior_precision = laplace_logprob(self.kernel.precision(), self.prior_laplace_b) + logdet
+            elif self.prior_precision_type == 'laplace+diagnormal':
+                # Laplace(Λ_|0,b) + Normal(diagonal(Λ)|0,1)
+                prior_precision = laplace_logprob(self.kernel.precision_off_diagonals(), self.prior_laplace_b) + normal_logprob(tf.linalg.tensor_diag_part(self.kernel.precision())) + logdet
+            elif self.prior_precision_type == 'horseshoe+diagnormal':
+                # HS(Λ_|λ) + Normal(diagonal(Λ)|0,1)
+                # X ~ HS(λ) -> X ~ N(0,λσ), σ ~ C+(0,1)
+                prior_precision = horseshoe_logprob(self.kernel.precision_off_diagonals_prot(), 1) + normal_logprob(tf.linalg.tensor_diag_part(self.kernel.precision())) + logdet
+            elif self.prior_precision_type == 'wishart':
+                prior_precision = matrix_wishart_logprob(self.kernel.L, self.kernel.precision()) + logdet
+            elif self.prior_precision_type == 'invwishart':
+                prior_precision = matrix_invwishart_logprob(self.kernel.L, self.kernel.precision()) + logdet
+            else:
+                # Uninformative prior: Normal(L|0,1)
+                prior_precision = normal_logprob(self.kernel.precision()) + logdet
+            prior_hyper = prior_precision + prior_kernel_logvariance
+        else:
+            # Logormal(0,1) prior on log-lengthscales
+            prior_hyper = -tf.reduce_sum(tf.square(self.kernel.loglengthscales)) / 2.0 + prior_kernel_logvariance
 
+        return prior_hyper
+    @tf.function
     def prior(self):
+        #tf.print({'kern.P': self.kernel.precision()}, output_stream=sys.stderr) 
         return -tf.reduce_sum(tf.square(self.U)) / 2.0 + self.prior_hyper()  + self.prior_Z()
 
     def __str__(self):
@@ -137,8 +169,7 @@ class DGP(BaseModel):
         for layer in self.layers:
             layer.Lm = None
 
-    def __init__(self, X, Y, n_inducing, kernels, likelihood, minibatch_size, window_size, output_dim=None,
-                 adam_lr=0.01, prior_type="uniform", full_cov=False, epsilon=0.01, mdecay=0.05,):
+    def __init__(self, X, Y, n_inducing, kernels, precise_kernel, likelihood, minibatch_size, window_size, output_dim=None, adam_lr=0.01, prior_type="uniform", prior_precision_type='laplace', prior_laplace_b=1, full_cov=False, epsilon=0.01, mdecay=0.05,):
         self.n_inducing = n_inducing
         self.kernels = kernels
         self.likelihood = likelihood
@@ -155,17 +186,18 @@ class DGP(BaseModel):
         X_running = X.copy()
         for l in range(n_layers):
             outputs = self.kernels[l+1].input_dim if l+1 < n_layers else self.output_dim#Y.shape[1]
-            self.layers.append(Layer(self.kernels[l], outputs, n_inducing, fixed_mean=(l+1 < n_layers), X=X_running, full_cov=full_cov if l+1<n_layers else False, prior_type=prior_type))
+            self.layers.append(Layer(self.kernels[l], precise_kernel, outputs, n_inducing, fixed_mean=(l+1 < n_layers), X=X_running, full_cov=full_cov if l+1<n_layers else False, prior_type=prior_type, prior_precision_type=prior_precision_type, prior_laplace_b=prior_laplace_b))
             X_running = np.matmul(X_running, self.layers[-1].mean)
 
         variables = []
         for l in self.layers:
-            variables += [l.U, l.Z, l.kernel.loglengthscales, l.kernel.logvariance]
+            # variables += [l.U, l.Z, l.kernel.loglengthscales, l.kernel.logvariance] LRBF-MOD
+            variables += [l.U, l.Z, l.kernel.L if precise_kernel else l.kernel.loglengthscales, l.kernel.logvariance]
 
         super().__init__(X, Y, variables, minibatch_size, window_size)
         self.f, self.fmeans, self.fvars = self.propagate(self.X_placeholder)
         self.y_mean, self.y_var = self.likelihood.predict_mean_and_var(self.fmeans[-1], self.fvars[-1])
-
+    
         self.prior = tf.add_n([l.prior() for l in self.layers])
         self.log_likelihood = self.likelihood.predict_density(self.fmeans[-1], self.fvars[-1], self.Y_placeholder)
 
@@ -189,10 +221,9 @@ class DGP(BaseModel):
         set_seed()
         init_op = tf.compat.v1.global_variables_initializer()
         try:
-            self.session.run(init_op, feed_dict=self.likelihood.initializable_feeds )
+            self.session.run(init_op, feed_dict=self.likelihood.initializable_feeds)
         except AttributeError:
             self.session.run(init_op)
-
 
     def predict_y(self, X, S, posterior=True):
         # assert S <= len(self.posterior_samples)
@@ -203,6 +234,7 @@ class DGP(BaseModel):
             m, v = self.session.run((self.y_mean, self.y_var), feed_dict=feed_dict)
             ms.append(m)
             vs.append(v)
+
         return np.stack(ms, 0), np.stack(vs, 0)
 
     def predict_f_samples(self, X, S):

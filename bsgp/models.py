@@ -4,7 +4,8 @@ from .dgp_model import DGP
 from scipy.stats import norm
 from scipy.special import logsumexp
 from .kernels import SquaredExponential as BgpSE
-from .likelihoods import Gaussian
+from .kernels import FullPrecisionRBF as BgpFullRBF
+from .likelihoods import Bernoulli
 import tensorflow as tf
 
 PRIORS = ['uniform', 'normal', 'determinantal', 'strauss']
@@ -24,6 +25,9 @@ class Model(object):
             n_layers = 1
             prior_type = None
             logdir = '/tmp/'
+            precise_kernel = False # LRBF-MOD
+            prior_precision_type = None # LRBF-MOD
+            prior_laplace_b = None # LRBF-MOD
 
         self.ARGS = ARGS
         self.model = None
@@ -42,15 +46,20 @@ class Model(object):
         if not self.model:
             for i in range(self.ARGS.n_layers):
                 output_dim = 196 if i >= 1 and X.shape[1] > 700 else X.shape[1]
-                kerns.append(BgpSE(output_dim, ARD=True, lengthscales=float(min(X.shape[1], output_dim))**0.5))
+                prior_precision_info = {'type': self.ARGS.prior_precision_type, 'hparams': self.ARGS.prior_laplace_b}
+                kernel = BgpFullRBF(variance=0.1, randomized=False, d=29, T=100, prior_precision_info=prior_precision_info) if self.ARGS.precise_kernel else BgpSE(output_dim, ARD=True, lengthscales=float(min(X.shape[1], output_dim))**0.5) 
+                kerns.append(kernel)
 
             mb_size = self.ARGS.minibatch_size if X.shape[0] > self.ARGS.minibatch_size else X.shape[0]
 
-            self.model = DGP(X, Y, self.ARGS.num_inducing, kerns, lik,
+            self.model = DGP(X, Y, self.ARGS.num_inducing, kerns, self.ARGS.precise_kernel, lik,
                              minibatch_size=mb_size,
                              window_size=self.ARGS.window_size,
                              full_cov=self.ARGS.full_cov,
-                             prior_type=self.ARGS.prior_type, output_dim=self.output_dim,
+                             prior_type=self.ARGS.prior_type, 
+                             prior_precision_type=self.ARGS.prior_precision_type,
+                             prior_laplace_b = self.ARGS.prior_laplace_b,
+                             output_dim=self.output_dim,
                              **kwargs)
             print(self.model)
 
@@ -77,7 +86,11 @@ class Model(object):
                         print('TEST  | iter = %6d       MNLL = %5.2f' % (_, mnll))
 
             self.model.collect_samples(self.ARGS.num_posterior_samples, self.ARGS.posterior_sample_spacing)
-
+            self.posterior_samples_kern_L = [list(self.model.posterior_samples[i].values())[-2].tolist() for i in range(self.ARGS.num_posterior_samples)] # LRBF-MOD
+            self.posterior_samples_kern_logvar = [list(self.model.posterior_samples[i].values())[-1].tolist() for i in range(self.ARGS.num_posterior_samples)] # LRBF-MOD
+            self.posterior_samples_U = [np.squeeze(list(self.model.posterior_samples[i].values())[0]).tolist() for i in range(self.ARGS.num_posterior_samples)] # LRBF-MOD
+            self.posterior_samples_Z = [np.squeeze(list(self.model.posterior_samples[i].values())[1]).tolist() for i in range(self.ARGS.num_posterior_samples)] # LRBF-MOD
+            
         except KeyboardInterrupt:  # pragma: no cover
             self.model.collect_samples(self.ARGS.num_posterior_samples, self.ARGS.posterior_sample_spacing)
             pass
@@ -90,15 +103,15 @@ class Model(object):
             ms.append(m)
             vs.append(v)
 
-        return np.concatenate(ms, 1), np.concatenate(vs, 1) 
+        return np.concatenate(ms, 1), np.concatenate(vs, 1)  
 
 
-class RegressionModel(Model):
+class ClassificationModel(Model):
     def __init__(self, prior_type, output_dim=None):
         super().__init__(prior_type, output_dim)
 
     def fit(self, X, Y, Xtest=None, Ytest=None, Ystd=None, **kwargs):
-        lik = Gaussian(np.var(Y, 0))
+        lik = Bernoulli()
         return self._fit(X, Y, lik, Xtest, Ytest, Ystd, **kwargs)
 
     def predict(self, Xs):
@@ -108,9 +121,15 @@ class RegressionModel(Model):
         return m, v
 
     def calculate_density(self, Xs, Ys, ymean=0., ystd=1.):
+        # cross-entropy mnll for classification
         ms, vs = self._predict(Xs, self.ARGS.num_posterior_samples)
-        logps = norm.logpdf(np.repeat(Ys[None, :, :]*ystd, self.ARGS.num_posterior_samples, axis=0), ms*ystd, np.sqrt(vs)*ystd)
-        return logsumexp(logps, axis=0) - np.log(self.ARGS.num_posterior_samples)
+        Ys_ = np.repeat(Ys[None, :, :], self.ARGS.num_posterior_samples, axis=0)
+        return np.mean(Ys_ * np.log(ms) + (1 - Ys_) * np.log(1 - ms))
+    
+    def calculate_accuracy(self, Xs, Ys, ymean=0., ystd=1.):
+        ms, vs = self._predict(Xs, self.ARGS.num_posterior_samples)
+        Y_pred = ms >= 0.5
+        return np.sum(np.repeat(Ys[None, :, :], self.ARGS.num_posterior_samples, axis=0) == Y_pred) / (Ys.shape[0]*self.ARGS.num_posterior_samples)
 
     def sample(self, Xs, S):
         ms, vs = self._predict(Xs, S)

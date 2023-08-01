@@ -1,8 +1,9 @@
 # Credit to GPflow
 
 import tensorflow as tf
+import sys
 
-
+@tf.function
 def base_conditional(Kmn, Kmm, Knn, f, *, full_cov=False, q_sqrt=None, white=False, return_Lm=False):
     """
     Given a g1 and g2, and distribution p and q such that
@@ -25,7 +26,7 @@ def base_conditional(Kmn, Kmm, Knn, f, *, full_cov=False, q_sqrt=None, white=Fal
     # compute kernel stuff
     num_func = tf.shape(f)[1]  # R
     Lm = tf.linalg.cholesky(Kmm)
-
+    #tf.print({'Lm': Lm}, output_stream=sys.stderr)
     # Compute the projection matrix A
     A = tf.linalg.triangular_solve(Lm, Kmn, lower=True)
 
@@ -66,7 +67,7 @@ def base_conditional(Kmn, Kmm, Knn, f, *, full_cov=False, q_sqrt=None, white=Fal
 
     return fmean, fvar # N x R, R x N x N or N x R
 
-
+@tf.function
 def conditional(Xnew, X, kern, f, *, full_cov=False, q_sqrt=None, white=False, return_Lm=False):
     """
     Given f, representing the GP at the points X, produce the mean and
@@ -99,11 +100,11 @@ def conditional(Xnew, X, kern, f, *, full_cov=False, q_sqrt=None, white=False, r
     """
 
     num_data = tf.shape(X)[0]  # M
-    Kmm = kern.K(X) + tf.eye(num_data, dtype=tf.float64) * 1e-7
+    Kmm = kern.K(X) + tf.ones(num_data, dtype=tf.float64) * 1e-7
     Kmn = kern.K(X, Xnew)
     if full_cov:
         Knn = kern.K(Xnew)
     else:
         Knn = kern.Kdiag(Xnew)
-
+    #tf.print({'Kmm': Kmm}, output_stream=sys.stderr)
     return base_conditional(Kmn, Kmm, Knn, f, full_cov=full_cov, q_sqrt=q_sqrt, white=white, return_Lm=return_Lm) # N x R, N x R or R x N x N
