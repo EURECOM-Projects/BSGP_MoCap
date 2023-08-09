@@ -53,3 +53,12 @@ def kron_ones(P, t):
     P = tf.linalg.LinearOperatorFullMatrix([P])
     H = tf.linalg.LinearOperatorFullMatrix([tf.ones((t,t), dtype=tf.float64)])
     return tf.squeeze(tf.linalg.LinearOperatorKronecker([H, P]).to_dense())
+
+def apply_pca(X, n_comp):
+    N = X.shape[0]
+    X = X - np.mean(X, axis=0) 
+    C = (1/N) * X.T @ X # N x N
+    A, P = np.linalg.eigh(C) # C = PAPᵀ
+    Pd = P[:, ::-1][:, 0:n_comp] # D x d
+    Z = X @ Pd # N x d
+    return Z, Pd
