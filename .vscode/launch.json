@@ -11,14 +11,10 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": ["--dataset", "mocap",
-               "--iterations", "256", 
-               "--num_inducing", "10",
-               "--num_posterior_samples", "256", 
-               "--precise_kernel", "1", 
-               "--prior_precision_type", "laplace+diagnormal",
-               //"--prior_laplace_b", "1",
-               "--kfold", "-1"
+            "args": [
+               "--features", "small",
+               "--sub_sampling", "8", 
+               "--kernel_computation_type", "single_sum"
               ]
         }
     ]
